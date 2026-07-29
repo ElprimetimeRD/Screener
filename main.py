@@ -1,0 +1,1755 @@
+"""Session Chart backend v2 — usa yfinance (maneja cookies/crumb de Yahoo,
+necesario porque Yahoo bloquea llamadas directas desde IPs de datacenter).
+Render: build = pip install -r requirements.txt
+        start = uvicorn main:app --host 0.0.0.0 --port $PORT
+"""
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+import pandas as pd
+import yfinance as yf
+
+app = FastAPI(title="Session Chart API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+ALLOWED_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1d"}
+
+
+def df_to_chart_json(df: pd.DataFrame) -> dict:
+    """Convierte el DataFrame de yfinance al shape chart-API que espera el frontend."""
+    if df is None or df.empty:
+        return {"chart": {"result": [], "error": None}}
+    # yfinance puede devolver columnas MultiIndex (Price, Ticker); aplanar
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    ts = [int(idx.timestamp()) for idx in df.index]
+
+    def col(name):
+        if name not in df.columns:
+            return [None] * len(df)
+        return [None if pd.isna(v) else float(v) for v in df[name]]
+
+    vol = [None if pd.isna(v) else int(v) for v in df["Volume"]] if "Volume" in df.columns else [None] * len(df)
+    quote = {
+        "open": col("Open"),
+        "high": col("High"),
+        "low": col("Low"),
+        "close": col("Close"),
+        "volume": vol,
+    }
+    return {"chart": {"result": [{"timestamp": ts, "indicators": {"quote": [quote]}, "meta": {}}], "error": None}}
+
+
+@app.get("/api/chart")
+def chart(symbol: str, period1: int, period2: int, interval: str = "5m"):
+    if interval not in ALLOWED_INTERVALS:
+        raise HTTPException(400, f"intervalo no soportado: {interval}")
+    if not symbol or len(symbol) > 12 or period2 <= period1:
+        raise HTTPException(400, "parámetros inválidos")
+    try:
+        df = yf.download(
+            tickers=symbol.upper(),
+            start=datetime.fromtimestamp(period1, tz=timezone.utc),
+            end=datetime.fromtimestamp(period2, tz=timezone.utc),
+            interval=interval,
+            prepost=False,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception as e:
+        raise HTTPException(502, f"yfinance falló: {e.__class__.__name__}: {e}")
+    return df_to_chart_json(df)
+
+
+@app.get("/api/diag")
+def diag():
+    """Diagnóstico rápido: intenta bajar 1 día de MU y reporta el resultado."""
+    try:
+        df = yf.download("MU", period="5d", interval="1d", progress=False, threads=False)
+        rows = 0 if df is None else len(df)
+        return {"ok": rows > 0, "rows": rows}
+    except Exception as e:
+        return {"ok": False, "error": f"{e.__class__.__name__}: {e}"}
+
+
+QUOTE_FIELDS = ("regularMarketPrice", "regularMarketVolume", "regularMarketChangePercent",
+                "regularMarketPreviousClose", "regularMarketOpen", "averageDailyVolume3Month",
+                "averageDailyVolume10Day", "marketState", "preMarketPrice",
+                "preMarketChangePercent", "postMarketPrice")
+
+
+def screener_quotes(limit_per=50):
+    """Trae los screeners CONSERVANDO sus datos de cotización.
+    Yahoo ya manda precio, volumen, cambio y volumen promedio en la misma
+    respuesta: escanear todo el universo cuesta una llamada, no 70 descargas."""
+    out = {}
+    try:
+        q = yf.EquityQuery("and", [
+            yf.EquityQuery("gt", ["dayvolume", 200000]),
+            yf.EquityQuery("eq", ["region", "us"]),
+        ])
+        for asc in (False, True):
+            try:
+                res = yf.screen(q, sortField="percentchange", sortAsc=asc, size=limit_per)
+                for qt in (res.get("quotes", []) if isinstance(res, dict) else []):
+                    s = (qt.get("symbol") or "").upper()
+                    if _clean_symbol(s) and s not in out:
+                        out[s] = qt
+            except Exception:
+                continue
+    except Exception:
+        pass
+    for scr in ("day_gainers", "small_cap_gainers", "aggressive_small_caps",
+                "most_actives", "day_losers"):
+        try:
+            res = yf.screen(scr, count=limit_per)
+            for qt in (res.get("quotes", []) if isinstance(res, dict) else []):
+                s = (qt.get("symbol") or "").upper()
+                if _clean_symbol(s) and s not in out:
+                    out[s] = qt
+        except Exception:
+            continue
+    return out
+
+
+def quote_snapshot(qt, mins_elapsed, premarket):
+    """Convierte una cotización del screener en métricas comparables."""
+    price = qt.get("regularMarketPrice")
+    prev = qt.get("regularMarketPreviousClose")
+    openp = qt.get("regularMarketOpen")
+    vol = qt.get("regularMarketVolume") or 0
+    avg = qt.get("averageDailyVolume3Month") or qt.get("averageDailyVolume10Day")
+    state = (qt.get("marketState") or "").upper()
+
+    if premarket or state == "PRE":
+        pm = qt.get("preMarketPrice")
+        if pm:
+            price = pm
+        chg = qt.get("preMarketChangePercent")
+        if chg is None and price and prev:
+            chg = (price - prev) / prev * 100
+    else:
+        chg = qt.get("regularMarketChangePercent")
+        if chg is None and price and prev:
+            chg = (price - prev) / prev * 100
+
+    frac = expected_vol_frac(mins_elapsed) if mins_elapsed > 0 else None
+    rvol = None
+    if avg and frac and frac > 0:
+        rvol = vol / (avg * frac)
+    elif avg and vol:
+        rvol = vol / avg  # fuera de sesión: fracción del día típico
+
+    gap = (openp - prev) / prev * 100 if (openp and prev) else None
+    return {"price": price, "prev": prev, "open": openp, "vol": vol, "avg": avg,
+            "chg": chg, "rvol": rvol, "gap": gap, "state": state,
+            "dvol": (vol * price) if (vol and price) else 0}
+
+
+@app.get("/api/radar")
+def radar(rvol_min: float = 2.5, move_min: float = 0.0, watch: str = "",
+          pm_min: float = 3.0, min_dvol: float = 250000, min_price: float = 0.10,
+          detail: int = 12):
+    """Radar en dos etapas:
+      1) barrido del universo con UNA llamada (los screeners ya traen precio,
+         volumen y % de cambio) -> ranking preliminar barato y rápido
+      2) velas de 1m SOLO para los mejores candidatos -> aceleración y estructura
+    Antes descargaba 70 símbolos completos en cada ronda; ahora bajan ~12."""
+    if not (1.0 <= rvol_min <= 30) or not (0 <= move_min <= 100):
+        raise HTTPException(400, "parámetros fuera de rango")
+    pinned = [w.upper().strip() for w in watch.replace(";", ",").replace(" ", ",").split(",") if w][:8]
+    ckey = f"{rvol_min}|{move_min}|{watch}|{pm_min}|{min_dvol}|{min_price}|{detail}"
+    hit = cached_result("radar", ckey, ttl=6 if detail <= 0 else 15)
+    if hit is not None:
+        return hit
+
+    now_et = datetime.now(tz=ET)
+    mins_now = now_et.hour * 60 + now_et.minute
+    weekday = now_et.weekday() < 5
+    live = (SESSION_OPEN_MIN <= mins_now <= SESSION_CLOSE_MIN) and weekday
+    premarket = (PREMARKET_OPEN_MIN <= mins_now < SESSION_OPEN_MIN) and weekday
+    mins_elapsed = max(0, min(390, mins_now - SESSION_OPEN_MIN)) if live else 390
+
+    # El umbral de liquidez debe escalar con la sesión: exigir $250K acumulados
+    # a las 9:35 descartaría justo a los movers tempranos (DFNS tenía $180K a esa
+    # hora). Al cierre sí exige el monto completo.
+    if premarket:
+        eff_dvol = min_dvol * 0.05          # el pre-market opera ~1-3% del día
+    else:
+        eff_dvol = min_dvol * max(0.02, expected_vol_frac(mins_elapsed))
+
+    quotes = screener_quotes()
+    now_ts = _time.time()
+    data_age = None
+    for qt in quotes.values():
+        t = qt.get("regularMarketTime") or qt.get("preMarketTime")
+        if isinstance(t, (int, float)) and t > 1e9:
+            age = now_ts - t
+            if 0 <= age < 3600 and (data_age is None or age < data_age):
+                data_age = age
+    note = None
+    if not quotes:
+        note = "screeners de Yahoo no disponibles"
+    for p in pinned:
+        quotes.setdefault(p, {"symbol": p})
+
+    # ---- etapa 1: ranking barato con los datos que ya vienen ----
+    prelim = []
+    for sym, qt in quotes.items():
+        snap = quote_snapshot(qt, mins_elapsed, premarket)
+        is_pinned = sym in pinned
+        price, rvol = snap["price"], snap["rvol"]
+        move = abs(snap["chg"] or 0)
+        if not is_pinned:
+            if price is None or price < min_price:
+                continue
+            if premarket:
+                # el volumen regular llega en 0 antes de abrir: filtrar por dvol
+                # aquí borraría todo. Se valida con las velas reales en la etapa 2.
+                if move < 2:
+                    continue
+            else:
+                if snap["dvol"] < eff_dvol:
+                    continue
+                if rvol is None or rvol < rvol_min or move < move_min:
+                    continue
+        # en pre-market manda el movimiento; en sesión, el volumen relativo
+        score = move if premarket else ((rvol or 0) + move / 10.0)
+        prelim.append({"sym": sym, "snap": snap, "pinned": is_pinned, "score": score})
+    prelim.sort(key=lambda c: (not c["pinned"], -c["score"]))
+
+    # ---- etapa 2: velas de 1m solo para los mejores ----
+    if detail <= 0:
+        detail = 0
+        top = []
+    else:
+        detail = max(4, min(24, detail if not premarket else max(detail, 18)))
+        top = prelim[:detail]
+    bars_by = {}
+    if top:
+        bars_by = download_intraday([c["sym"] for c in top], period="1d",
+                                    interval="1m", prepost=True, auto_adjust=False)
+
+    cands = []
+    session_date = None
+    for c in prelim[:40]:
+        sym, snap = c["sym"], c["snap"]
+        bars = bars_by.get(sym)
+        accel, stair, elapsed, pm_pct = None, None, mins_elapsed, None
+        pm_dvol = None
+        flow = None
+        if bars:
+            by_date = {}
+            for b in bars:
+                et = datetime.fromtimestamp(b["t"], tz=ET)
+                m = et.hour * 60 + et.minute
+                if PREMARKET_OPEN_MIN <= m <= SESSION_CLOSE_MIN:
+                    by_date.setdefault(et.date(), []).append((m, b))
+            if by_date:
+                d = max(by_date)
+                if session_date is None or d > session_date:
+                    session_date = d
+                pre = [b for m, b in by_date[d] if m < SESSION_OPEN_MIN]
+                sess = [b for m, b in by_date[d] if m >= SESSION_OPEN_MIN]
+                use = pre if (premarket or not sess) else sess
+                if len(use) >= 10:
+                    r5 = sum(b["volume"] for b in use[-5:])
+                    p5 = sum(b["volume"] for b in use[-10:-5])
+                    accel = round(r5 / p5, 1) if p5 > 0 else None
+                if use:
+                    elapsed = len(use)
+                try:
+                    stair = staircase_metrics(use)
+                except Exception:
+                    stair = None
+                try:
+                    flow = flow_split(use)
+                except Exception:
+                    flow = None
+                if pre:
+                    pm_vol = sum(b["volume"] for b in pre)
+                    pm_dvol = pm_vol * (snap["price"] or 0)
+                    if snap["avg"]:
+                        pm_pct = round(pm_vol / snap["avg"] * 100, 1)
+
+        rv = snap["rvol"] or 0
+        move = abs(snap["chg"] or 0)
+        phase = "pre" if premarket else "reg"
+        if phase == "pre" and not c["pinned"] and pm_dvol is not None:
+            if pm_dvol < eff_dvol or (pm_pct is not None and pm_pct < pm_min):
+                continue
+        if phase == "pre":
+            if (pm_pct or 0) >= 15 and move >= 10:
+                grade = "caliente"
+            elif (pm_pct or 0) >= 5 and move >= 4:
+                grade = "activo"
+            else:
+                grade = "vigilar"
+        else:
+            if rv >= 5 and (accel or 0) >= 1.5 and move >= 3:
+                grade = "caliente"
+            elif rv >= 3 and ((accel or 0) >= 1.5 or move >= 2):
+                grade = "activo"
+            else:
+                grade = "vigilar"
+
+        cands.append({
+            "sym": sym, "price": round(snap["price"], 2) if snap["price"] else None,
+            "rvol": round(snap["rvol"], 1) if snap["rvol"] else None,
+            "accel": accel, "gap": round(snap["gap"], 2) if snap["gap"] is not None else None,
+            "chg_total": round(snap["chg"], 2) if snap["chg"] is not None else None,
+            "chg_open": None, "elapsed": elapsed,
+            "dvol": round(pm_dvol if (phase == "pre" and pm_dvol is not None) else snap["dvol"]),
+            "grade": grade, "pinned": c["pinned"], "phase": phase,
+            "pm_pct": pm_pct, "stair": stair, "flow": flow,
+            "trend3": trend3(stats.get(sym)),
+            "trend3": trend3(stats.get(sym)),
+            "detailed": sym in bars_by,
+        })
+
+    order = {"caliente": 0, "activo": 1, "vigilar": 2}
+    cands.sort(key=lambda c: (not c.get("pinned"), order[c["grade"]],
+                              -((c["pm_pct"] if c["phase"] == "pre" else c["rvol"]) or 0)))
+    bars_by.clear()
+    gc.collect()
+    result = {"min_dvol_applied": round(eff_dvol),
+              "data_age_sec": round(data_age) if data_age is not None else None,
+              "detail_pending": detail <= 0,
+              "universe": len(quotes), "candidates": cands[:40],
+              "mins_into_session": mins_elapsed, "live": live, "premarket": premarket,
+              "session_date": str(session_date) if session_date else None,
+              "detailed": len(top), "note": note}
+    store_result("radar", ckey, result)
+    return result
+
+
+BUCKET_LABELS = ["9:30-10:00", "10:00-10:30", "10:30-11:00", "11:00-11:30",
+                 "11:30-12:00", "12:00-12:30", "12:30-13:00", "13:00-13:30",
+                 "13:30-14:00", "14:00-14:30", "14:30-15:00", "15:00-15:30",
+                 "15:30-16:00"]
+
+
+def _bucket_of(mins):
+    if mins < SESSION_OPEN_MIN or mins > SESSION_CLOSE_MIN:
+        return None
+    b = int((mins - SESSION_OPEN_MIN) // 30)
+    return min(12, max(0, b))
+
+
+@app.get("/api/hours")
+def hours(days: int = 5, symbols: int = 25, k: float = 3.0, base: int = 20):
+    """Histograma de mercado: ¿a qué hora ocurren realmente los eventos de
+    volumen, los máximos y los mínimos? Clave: compara contra el volumen base
+    de cada franja. Los eventos se agrupan naturalmente donde hay más volumen
+    (apertura y cierre); solo hay 'efecto mediodía' si la proporción de eventos
+    SUPERA la proporción de volumen de esa franja."""
+    if not (1 <= days <= 7) or not (5 <= symbols <= 40):
+        raise HTTPException(400, "parámetros fuera de rango")
+    ckey = f"{days}|{symbols}|{k}|{base}"
+    hit = cached_result("hours", ckey, ttl=900)
+    if hit is not None:
+        return hit
+
+    syms, note = get_universe()
+    syms = syms[:symbols]
+    data = download_intraday(syms, period=f"{days}d", interval="1m",
+                             prepost=False, auto_adjust=False)
+    if not data:
+        raise HTTPException(502, "no se pudo descargar datos intradía")
+
+    n = len(BUCKET_LABELS)
+    ev_count = [0] * n
+    ev_dvol = [0.0] * n
+    vol_by = [0.0] * n
+    highs = [0] * n
+    lows = [0] * n
+    sessions = 0
+    syms_used = set()
+
+    for s, bars in data.items():
+        by_date = {}
+        for b in bars:
+            et = datetime.fromtimestamp(b["t"], tz=ET)
+            m = et.hour * 60 + et.minute
+            bk = _bucket_of(m)
+            if bk is not None:
+                by_date.setdefault(et.date(), []).append((bk, b))
+        for d, rows in by_date.items():
+            if len(rows) < 60:          # sesiones incompletas distorsionan
+                continue
+            sessions += 1
+            syms_used.add(s)
+            sess_bars = [b for _, b in rows]
+            # volumen base por franja
+            for bk, b in rows:
+                vol_by[bk] += b["volume"]
+            # máximo y mínimo de la sesión
+            hi_bk = max(rows, key=lambda x: x[1]["high"])[0]
+            lo_bk = min(rows, key=lambda x: x[1]["low"])[0]
+            highs[hi_bk] += 1
+            lows[lo_bk] += 1
+            # eventos de volumen
+            try:
+                for e in detect_spikes(sess_bars, k, base, 50000):
+                    et = datetime.fromtimestamp(e["start"], tz=ET)
+                    bk = _bucket_of(et.hour * 60 + et.minute)
+                    if bk is not None:
+                        ev_count[bk] += 1
+                        ev_dvol[bk] += e["vol"] * e["price"]
+            except Exception:
+                continue
+
+    data.clear()
+    gc.collect()
+
+    tot_ev = sum(ev_count) or 1
+    tot_vol = sum(vol_by) or 1
+    tot_hi = sum(highs) or 1
+    tot_lo = sum(lows) or 1
+
+    rows_out = []
+    for i in range(n):
+        ev_pct = ev_count[i] / tot_ev * 100
+        vol_pct = vol_by[i] / tot_vol * 100
+        rows_out.append({
+            "label": BUCKET_LABELS[i],
+            "events": ev_count[i],
+            "ev_pct": round(ev_pct, 1),
+            "vol_pct": round(vol_pct, 1),
+            # >1 = más eventos de los que el volumen de esa franja explicaría
+            "excess": round(ev_pct / vol_pct, 2) if vol_pct > 0.01 else None,
+            "high_pct": round(highs[i] / tot_hi * 100, 1),
+            "low_pct": round(lows[i] / tot_lo * 100, 1),
+            "ev_dvol": round(ev_dvol[i]),
+        })
+
+    result = {"buckets": rows_out, "sessions": sessions,
+              "symbols": len(syms_used), "days": days,
+              "total_events": sum(ev_count), "note": note}
+    store_result("hours", ckey, result)
+    return result
+
+
+def burst_analysis(bars, window=5):
+    """Encuentra la ráfaga alcista más violenta de la sesión en una ventana de
+    N minutos y mide si el dinero que la movió fue de tamaño institucional."""
+    if len(bars) < window + 2:
+        return None
+    best = None
+    for i in range(window, len(bars)):
+        a = bars[i - window]["close"]
+        b = bars[i]["close"]
+        if a <= 0:
+            continue
+        move = (b - a) / a * 100
+        if best is None or move > best["move"]:
+            seg = bars[i - window:i + 1]
+            vol = sum(x["volume"] for x in seg)
+            dvol = sum(x["volume"] * x["close"] for x in seg)
+            hi = max(x["high"] for x in seg)
+            best = {"move": move, "end_i": i, "start_px": a, "end_px": b,
+                    "high": hi, "vol": vol, "dvol": dvol,
+                    "dpm": dvol / max(1, len(seg)),
+                    "t": bars[i]["t"], "mins_ago": len(bars) - 1 - i}
+    return best
+
+
+@app.get("/api/whale")
+def whale(min_move: float = 10.0, window: int = 5, min_rvol: float = 5.0,
+          min_dpm: float = 500000, min_price: float = 0.50, scan: int = 25):
+    """Pantalla de MÁXIMA CONVICCIÓN. Una sola pregunta: ¿hay dinero grande
+    entrando AHORA con violencia y sosteniéndose?
+
+    Cinco condiciones independientes, todas verificables:
+      1 VELOCIDAD  el precio subió >= min_move% en `window` minutos
+      2 VOLUMEN    el día acumula >= min_rvol veces su promedio de 30 días
+      3 DINERO     la ráfaga movió >= min_dpm dólares POR MINUTO (tamaño ballena)
+      4 FLUJO      la presión es compradora (>=65% del volumen)
+      5 SOSTIENE   conserva >=60% del impulso (no fue un pico que se desinfló)
+
+    NO es una garantía: es confluencia. Cuantas más se cumplen, mayor la
+    convicción, nunca la certeza."""
+    if not (0 < min_move <= 100) or not (2 <= window <= 30) or not (5 <= scan <= 40):
+        raise HTTPException(400, "parámetros fuera de rango")
+    ckey = f"{min_move}|{window}|{min_rvol}|{min_dpm}|{min_price}|{scan}"
+    hit = cached_result("whale", ckey, ttl=12)
+    if hit is not None:
+        return hit
+
+    now_et = datetime.now(tz=ET)
+    mins_now = now_et.hour * 60 + now_et.minute
+    weekday = now_et.weekday() < 5
+    live = (SESSION_OPEN_MIN <= mins_now <= SESSION_CLOSE_MIN) and weekday
+    premarket = (PREMARKET_OPEN_MIN <= mins_now < SESSION_OPEN_MIN) and weekday
+    mins_elapsed = max(1, min(390, mins_now - SESSION_OPEN_MIN)) if live else 390
+
+    quotes = screener_quotes()
+    # preselección barata: solo lo que sube y tiene precio operable
+    pre = []
+    for sym, qt in quotes.items():
+        snap = quote_snapshot(qt, mins_elapsed, premarket)
+        if snap["price"] is None or snap["price"] < min_price:
+            continue
+        if (snap["chg"] or 0) <= 0:
+            continue
+        pre.append((sym, snap, (snap["rvol"] or 0) * 10 + (snap["chg"] or 0)))
+    pre.sort(key=lambda x: -x[2])
+    pre = pre[:(max(scan, 35) if premarket else scan)]
+    if not pre:
+        result = {"candidates": [], "near": [], "live": live, "premarket": premarket,
+                  "scanned": 0, "universe": len(quotes)}
+        store_result("whale", ckey, result)
+        return result
+
+    deep = [p[0] for p in pre]
+    stats3 = daily_stats(deep)          # cierres diarios para la tendencia de 3 días
+    data = download_intraday(deep, period="1d", interval="1m",
+                             prepost=True, auto_adjust=False)
+    out = []
+    for sym, snap, _ in pre:
+        bars = data.get(sym)
+        if not bars:
+            continue
+        pre_b, sess_b = [], []
+        today = max((datetime.fromtimestamp(b["t"], tz=ET).date() for b in bars), default=None)
+        for b in bars:
+            et = datetime.fromtimestamp(b["t"], tz=ET)
+            if et.date() != today:
+                continue
+            m = et.hour * 60 + et.minute
+            if PREMARKET_OPEN_MIN <= m < SESSION_OPEN_MIN:
+                pre_b.append(b)
+            elif SESSION_OPEN_MIN <= m <= SESSION_CLOSE_MIN:
+                sess_b.append(b)
+        use = pre_b if (premarket or not sess_b) else sess_b
+        if len(use) < window + 2:
+            continue
+
+        burst = burst_analysis(use, window)
+        if not burst:
+            continue
+        cum = sum(b["volume"] for b in use)
+        # promedio de 30 sesiones calculado de las velas diarias — es el mismo
+        # que muestra TradingView. El campo del quote de Yahoo es TRIMESTRAL y en
+        # un stock que acaba de explotar da un multiplicador inflado.
+        adv = ((stats3.get(sym) or {}).get("avg_vol")) or snap["avg"]
+        if premarket or not sess_b:
+            # antes de abrir: el volumen se mide como % del día típico
+            rvol = (cum / adv * 100) if adv else None
+            rvol_kind = "pct_dia"
+            rvol_ok = (rvol or 0) >= 10
+            rvol_txt = (f"{rvol:.0f}% del día típico" if rvol is not None else "—")
+        else:
+            frac = expected_vol_frac(mins_elapsed)
+            rvol = (cum / (adv * frac)) if (adv and frac > 0) else None
+            rvol_kind = "rvol"
+            rvol_ok = (rvol or 0) >= min_rvol
+            rvol_txt = (f"{rvol:.1f}x lo normal a esta hora" if rvol is not None else "—")
+
+        fl = flow_split(use) or {}
+        buy_pct = fl.get("buy_pct")
+        # extensión total desde la apertura de la sesión: el estudio de tasas base
+        # muestra que <10% de extensión hace fade el 93% de las veces, mientras que
+        # 100%+ solo el 11%. Es el filtro que más cambia la lectura.
+        sess_open = (sess_b[0]["open"] if sess_b else use[0]["open"])
+        ext_open = ((use[-1]["close"] - sess_open) / sess_open * 100) if sess_open else None
+        last = use[-1]["close"]
+        span = burst["high"] - burst["start_px"]
+        retention = ((last - burst["start_px"]) / span * 100) if span > 0 else 0.0
+
+        checks = [
+            {"k": f"Subió {burst['move']:.1f}% en {window} min", "ok": burst["move"] >= min_move},
+            {"k": f"Volumen: {rvol_txt}", "ok": bool(rvol_ok)},
+            {"k": f"${burst['dpm']/1e6:.2f}M por minuto en la ráfaga", "ok": burst["dpm"] >= min_dpm},
+            {"k": f"Flujo comprador {buy_pct:.0f}%" if buy_pct is not None else "Flujo comprador —",
+             "ok": (buy_pct or 0) >= 65},
+            {"k": f"Conserva {retention:.0f}% del impulso", "ok": retention >= 60},
+        ]
+        score = sum(1 for c in checks if c["ok"])
+        # nada de descartar en silencio: lo que no llega se reporta como "cerca",
+        # con lo que le falta. Solo se excluye el ruido sin sustancia alguna.
+        substance = (burst["dpm"] >= min_dpm * 0.15) or bool(rvol_ok) or burst["move"] >= min_move * 0.6
+        if score < 1 or burst["move"] <= 0 or not substance:
+            continue
+        verdict = ("MÁXIMA" if score == 5 else "ALTA" if score == 4
+                   else "MEDIA" if score == 3 else "CERCA")
+        missing = [c["k"].split(":")[0].split("(")[0].strip() for c in checks if not c["ok"]]
+        out.append({
+            "trend3": trend3(stats3.get(sym)),
+            "missing": missing,
+            "sym": sym, "price": round(last, 2), "verdict": verdict, "score": score,
+            "move": round(burst["move"], 1), "mins_ago": burst["mins_ago"],
+            "dpm": round(burst["dpm"]), "burst_dvol": round(burst["dvol"]),
+            "rvol": round(rvol, 1) if rvol is not None else None, "rvol_kind": rvol_kind,
+            "buy_pct": buy_pct, "retention": round(retention),
+            "chg_day": snap["chg"], "checks": checks,
+            "ext_open": round(ext_open, 1) if ext_open is not None else None,
+            "fade_band": ext_band(ext_open),
+            "health": assess_movement(use, burst, window, snap.get("prev")),
+            "vol_today": int(cum), "avg_vol": int(adv) if adv else None,
+            "mins_elapsed": (len(use) if (premarket or not sess_b) else mins_elapsed),
+            "trend3": trend3(stats3.get(sym)),
+            "divergence": fl.get("divergence"),
+        })
+
+    data.clear()
+    gc.collect()
+    # dilución: solo para los de mayor convicción (llamada externa, cacheada 6h).
+    # Un 424B5/S-1/S-3 reciente convierte cada spike en la salida de la empresa.
+    for c in [x for x in out if x["score"] >= 4][:6]:
+        try:
+            fl_ = sec_recent(c["sym"], limit=6)
+            bad = [f for f in fl_ if f.get("bias") == "bajista"]
+            good = [f for f in fl_ if f.get("bias") == "alcista"]
+            c["dilution"] = bad[0]["type"] if bad else None
+            c["insider_stake"] = good[0]["type"] if good else None
+        except Exception:
+            c["dilution"] = None
+
+    order_state = {"INTACTO": 0, "DETERIORÁNDOSE": 1, "ROTO": 2}
+    def rank(c):
+        h = c.get("health") or {}
+        return (order_state.get(h.get("state"), 3), -c["score"],
+                -(h.get("health") or 0), -c["dpm"])
+    out.sort(key=rank)
+    hits = [c for c in out if c["score"] >= 3]
+    near = [c for c in out if c["score"] < 3]
+    try:
+        log_signals(hits, mins_elapsed)
+        update_outcomes()
+    except Exception:
+        pass
+    result = {"base_rates": BASE_RATES,
+              "candidates": hits[:10], "near": near[:8],
+              "live": live, "premarket": premarket,
+              "scanned": len(pre), "universe": len(quotes),
+              "params": {"min_move": min_move, "window": window,
+                         "min_rvol": min_rvol, "min_dpm": min_dpm}}
+    store_result("whale", ckey, result)
+    return result
+
+
+# ================= contexto externo: catalizador, filings, sentimiento =================
+import urllib.request
+import urllib.parse
+import json as _json
+import re as _re
+
+_ctx_cache = {}
+
+# La SEC exige User-Agent identificable en todas las peticiones automatizadas
+SEC_UA = "SessionChart/1.0 (screener personal; contacto via github)"
+
+# Tipos de filing que mueven precio, con su lectura
+FILING_MEANING = {
+    "SC 13D": ("🐋 participación >5% con intención activa", "alcista"),
+    "SC 13G": ("🐋 participación >5% pasiva", "alcista"),
+    "SC 13D/A": ("🐋 cambio en participación >5%", "atención"),
+    "8-K": ("evento material (noticia corporativa)", "atención"),
+    "4": ("operación de un insider", "atención"),
+    "424B5": ("⚠ oferta de acciones — DILUCIÓN", "bajista"),
+    "424B4": ("⚠ oferta de acciones — DILUCIÓN", "bajista"),
+    "S-1": ("⚠ registro para vender acciones — DILUCIÓN", "bajista"),
+    "S-3": ("⚠ registro estantería — DILUCIÓN potencial", "bajista"),
+    "S-3ASR": ("⚠ registro estantería — DILUCIÓN potencial", "bajista"),
+}
+
+
+def _get_json(url, headers=None, timeout=8):
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": SEC_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return _json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _get_text(url, headers=None, timeout=8):
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": SEC_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def sec_recent(sym, limit=6):
+    """Filings recientes en EDGAR. Aquí es donde se anuncia de verdad la
+    entrada de una ballena (13D/13G) y también la dilución (424B/S-1),
+    que es la trampa clásica del small cap que acaba de correr."""
+    url = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK="
+           + urllib.parse.quote(sym) + "&type=&dateb=&owner=include&count="
+           + str(limit) + "&output=atom")
+    txt = _get_text(url)
+    out = []
+    for entry in _re.findall(r"<entry>(.*?)</entry>", txt, _re.S)[:limit]:
+        def pick(tag):
+            m = _re.search(r"<" + tag + r"[^>]*>(.*?)</" + tag + ">", entry, _re.S)
+            return _re.sub(r"<[^>]+>", "", m.group(1)).strip() if m else None
+        ftype = pick("filing-type") or ""
+        fdate = pick("filing-date") or ""
+        link = None
+        m = _re.search(r'<link[^>]*href="([^"]+)"', entry)
+        if m:
+            link = m.group(1)
+        meaning, bias = FILING_MEANING.get(ftype.upper(), ("", None))
+        out.append({"type": ftype, "date": fdate, "meaning": meaning,
+                    "bias": bias, "link": link})
+    return out
+
+
+def reddit_buzz(sym):
+    """Menciones en Reddit (ApeWisdom, agrega WSB y subs relacionados).
+    OJO: es INDICADOR REZAGADO. Cuando el retail habla, la ballena ya entró.
+    Su utilidad real es detectar pumps de multitud, que son los que colapsan."""
+    data = _get_json("https://apewisdom.io/api/v1.0/filter/all-stocks/page/1")
+    for row in (data.get("results") or []):
+        if (row.get("ticker") or "").upper() == sym.upper():
+            mentions = int(row.get("mentions") or 0)
+            prev = int(row.get("mentions_24h_ago") or 0)
+            chg = ((mentions - prev) / prev * 100) if prev else None
+            return {"mentions": mentions, "prev": prev,
+                    "change_pct": round(chg, 1) if chg is not None else None,
+                    "rank": row.get("rank"), "upvotes": row.get("upvotes")}
+    return {"mentions": 0, "rank": None, "change_pct": None}
+
+
+def ticker_news(sym, limit=5):
+    """Titulares recientes vía Yahoo. La antigüedad importa más que el texto:
+    una noticia de hace 20 minutos explica el movimiento; una de ayer, no."""
+    items = []
+    try:
+        raw = yf.Ticker(sym).news or []
+    except Exception:
+        raw = []
+    now = _time.time()
+    for n in raw[:limit]:
+        c = n.get("content") or n
+        title = c.get("title") or n.get("title")
+        pub = n.get("providerPublishTime") or c.get("pubDate")
+        ts = None
+        if isinstance(pub, (int, float)):
+            ts = float(pub)
+        elif isinstance(pub, str):
+            try:
+                ts = datetime.fromisoformat(pub.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                ts = None
+        age_min = round((now - ts) / 60) if ts else None
+        src = (c.get("provider") or {}).get("displayName") if isinstance(c.get("provider"), dict) else n.get("publisher")
+        if title:
+            items.append({"title": title, "age_min": age_min, "source": src})
+    items.sort(key=lambda x: (x["age_min"] is None, x["age_min"] or 1e9))
+    return items[:limit]
+
+
+@app.get("/api/context")
+def context(sym: str):
+    """Contexto externo de UN símbolo: por qué se está moviendo.
+    Cada fuente falla por separado sin tumbar el resto."""
+    sym = (sym or "").upper().strip()
+    if not _clean_symbol(sym):
+        raise HTTPException(400, "símbolo inválido")
+    ent = _ctx_cache.get(sym)
+    if ent and (_time.time() - ent[1]) < 300:
+        return ent[0]
+
+    out = {"sym": sym, "news": [], "filings": [], "reddit": None, "errors": []}
+    try:
+        out["news"] = ticker_news(sym)
+    except Exception as e:
+        out["errors"].append("noticias: " + e.__class__.__name__)
+    try:
+        out["filings"] = sec_recent(sym)
+    except Exception as e:
+        out["errors"].append("SEC: " + e.__class__.__name__)
+    try:
+        out["reddit"] = reddit_buzz(sym)
+    except Exception as e:
+        out["errors"].append("reddit: " + e.__class__.__name__)
+
+    # veredicto de contexto
+    flags = []
+    for f in out["filings"]:
+        if f.get("bias") == "alcista" and f.get("meaning"):
+            flags.append({"txt": f["type"] + " · " + f["meaning"], "bias": "alcista"})
+        elif f.get("bias") == "bajista":
+            flags.append({"txt": f["type"] + " · " + f["meaning"], "bias": "bajista"})
+    fresh = [n for n in out["news"] if (n.get("age_min") or 9999) <= 120]
+    if fresh:
+        flags.append({"txt": "noticia de hace " + str(fresh[0]["age_min"]) + " min", "bias": "atención"})
+    rd = out["reddit"] or {}
+    if (rd.get("mentions") or 0) >= 50:
+        flags.append({"txt": "Reddit: " + str(rd["mentions"]) + " menciones (indicador rezagado)",
+                      "bias": "retail"})
+    out["flags"] = flags
+    _ctx_cache[sym] = (out, _time.time())
+    return out
+
+
+def assess_movement(use, burst, window, prev_close):
+    """Mide la SALUD de un movimiento en curso: niveles objetivos que definen el
+    riesgo y cuáles de las condiciones que lo hicieron señal ya se rompieron."""
+    if not use or len(use) < 12:
+        return None
+    last = use[-1]["close"]
+    burst = burst or {}
+    sm = session_metrics(use)
+    vwap = sm.get("vwap")
+    day_high = max(b["high"] for b in use)
+    day_low = min(b["low"] for b in use)
+    day_open = use[0]["open"]
+
+    def lvl(name, px, note):
+        if not px:
+            return None
+        return {"name": name, "price": round(float(px), 2),
+                "dist_pct": round((px - last) / last * 100, 2), "note": note}
+
+    levels = [l for l in [
+        lvl("Máximo del día", day_high, "romperlo confirma continuación"),
+        lvl("VWAP", vwap, "precio institucional de referencia"),
+        lvl("Origen de la ráfaga", burst.get("start_px"), "abajo, el impulso se anuló"),
+        lvl("Apertura", day_open, "perderla borra la sesión"),
+        lvl("Cierre anterior", prev_close, "abajo, el día pasa a negativo"),
+    ] if l]
+
+    alerts = []
+    if vwap and last < vwap:
+        alerts.append({"txt": "Perdió el VWAP", "sev": "grave"})
+    if burst.get("start_px") and last < burst["start_px"]:
+        alerts.append({"txt": "Perdió el origen de la ráfaga: el impulso se anuló", "sev": "grave"})
+
+    recent = use[-5:]
+    rate_now = sum(b["volume"] for b in recent) / max(1, len(recent))
+    rate_burst = burst.get("vol", 0) / max(1, window + 1)
+    vol_ratio = (rate_now / rate_burst) if rate_burst else None
+    if vol_ratio is not None and vol_ratio < 0.25:
+        alerts.append({"txt": f"El volumen se secó: {vol_ratio*100:.0f}% del ritmo de la ráfaga",
+                       "sev": "aviso"})
+
+    tail = flow_split(use[-15:]) if len(use) >= 15 else None
+    if tail and tail["delta_pct"] <= -10:
+        alerts.append({"txt": f"El flujo se giró vendedor ({tail['buy_pct']:.0f}% compra en 15 min)",
+                       "sev": "grave"})
+
+    span = (burst.get("high", day_high) - burst.get("start_px", day_low))
+    retention = ((last - burst.get("start_px", day_low)) / span * 100) if span > 0 else None
+    if retention is not None and retention < 50:
+        alerts.append({"txt": f"Devolvió más de la mitad del impulso (conserva {retention:.0f}%)",
+                       "sev": "grave"})
+
+    hi_i = max(range(len(use)), key=lambda i: use[i]["high"])
+    after = use[hi_i + 1:]
+    if len(after) >= 10:
+        h1 = max(b["high"] for b in after[:len(after) // 2])
+        h2 = max(b["high"] for b in after[len(after) // 2:])
+        if h2 < h1 * 0.995:
+            alerts.append({"txt": "Máximos decrecientes desde el pico", "sev": "aviso"})
+
+    mins_since_high = len(use) - 1 - hi_i
+    if mins_since_high >= 30 and last < day_high * 0.97:
+        alerts.append({"txt": f"{mins_since_high} min sin hacer nuevo máximo", "sev": "aviso"})
+
+    graves = sum(1 for a in alerts if a["sev"] == "grave")
+    health = max(0, 100 - graves * 30 - (len(alerts) - graves) * 12)
+    state = "INTACTO" if health >= 70 else ("DETERIORÁNDOSE" if health >= 40 else "ROTO")
+
+    return {"price": round(last, 2), "state": state, "health": health,
+            "levels": levels, "alerts": alerts,
+            "retention": round(retention) if retention is not None else None,
+            "vwap": round(vwap, 2) if vwap else None,
+            "day_high": round(day_high, 2), "day_low": round(day_low, 2),
+            "vol_ratio": round(vol_ratio, 2) if vol_ratio is not None else None,
+            "flow15": tail["buy_pct"] if tail else None,
+            "mins_since_high": mins_since_high,
+            "burst_origin": round(burst["start_px"], 2) if burst.get("start_px") else None}
+
+
+@app.get("/api/track")
+def track(sym: str, window: int = 5):
+    """Seguimiento de un símbolo concreto (mismo análisis que llevan las tarjetas)."""
+    sym = (sym or "").upper().strip()
+    if not _clean_symbol(sym):
+        raise HTTPException(400, "símbolo inválido")
+    hit = cached_result("track", sym, ttl=10)
+    if hit is not None:
+        return hit
+    st = (daily_stats([sym]) or {}).get(sym) or {}
+    data = download_intraday([sym], period="1d", interval="1m",
+                             prepost=True, auto_adjust=False)
+    bars_all = data.get(sym) or []
+    today = max((datetime.fromtimestamp(b["t"], tz=ET).date() for b in bars_all), default=None)
+    pre_b, sess = [], []
+    for b in bars_all:
+        et = datetime.fromtimestamp(b["t"], tz=ET)
+        if et.date() != today:
+            continue
+        m = et.hour * 60 + et.minute
+        if PREMARKET_OPEN_MIN <= m < SESSION_OPEN_MIN:
+            pre_b.append(b)
+        elif SESSION_OPEN_MIN <= m <= SESSION_CLOSE_MIN:
+            sess.append(b)
+    use = sess if sess else pre_b
+    res = assess_movement(use, burst_analysis(use, window), window, st.get("prev_close"))
+    data.clear()
+    gc.collect()
+    if not res:
+        raise HTTPException(404, "sin datos intradía suficientes")
+    res["sym"] = sym
+    store_result("track", sym, res)
+    return res
+
+
+# ================= registro de señales: sin esto no se puede medir nada =================
+import os
+import sqlite3
+import csv as _csv
+import io as _io
+
+DB_PATH = os.environ.get("SIGNAL_DB", "signals.db")
+
+# Tasas base publicadas para gap-ups de small caps (SmallCapLab, 3.000+ eventos).
+# Se muestran en pantalla para que la señal se compare SIEMPRE contra el prior.
+BASE_RATES = {
+    "fade_vs_open": 64.6,      # % que cierra por debajo de su apertura
+    "below_vwap": 72.8,        # % que cierra por debajo del VWAP
+    "gap_down_next": 70.6,     # % que abre en gap-down al día siguiente
+    "hod_first_15": 46.6,      # % cuyo máximo del día se fija en los primeros 15 min
+}
+
+# Gradiente de fade por extensión desde la apertura (mismo estudio).
+# Contraintuitivo y central: cuanto MENOS extendido, MÁS probable el fade.
+EXT_BANDS = [
+    (10,   93.3, "zona de máximo fade"),
+    (25,   78.0, "fade muy probable"),
+    (50,   55.0, "fade probable"),
+    (100,  30.0, "fade menos probable"),
+    (1e9,  10.7, "extensión extrema: fade poco probable"),
+]
+
+
+def ext_band(ext_pct):
+    """Devuelve la tasa histórica de fade para una extensión dada desde la apertura."""
+    if ext_pct is None:
+        return None
+    for lim, rate, label in EXT_BANDS:
+        if ext_pct < lim:
+            return {"ext_pct": round(ext_pct, 1), "fade_rate": rate, "label": label}
+    return None
+
+
+def _db():
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.execute("""CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER, date TEXT, sym TEXT,
+        score INTEGER, verdict TEXT, state TEXT,
+        price REAL, move5 REAL, rvol REAL, dpm REAL,
+        buy_pct REAL, retention REAL, ext_open REAL,
+        mins_into INTEGER, dilution INTEGER, trend3_net REAL,
+        p5 REAL, p15 REAL, p30 REAL, pclose REAL,
+        UNIQUE(date, sym))""")
+    conn.commit()
+    return conn
+
+
+def log_signals(cands, mins_into):
+    """Registra una vez por símbolo y día cada señal de convicción >=4.
+    Automático: el usuario no tiene que hacer nada."""
+    if not cands:
+        return 0
+    now = int(_time.time())
+    day = datetime.now(tz=ET).date().isoformat()
+    n = 0
+    try:
+        conn = _db()
+        for c in cands:
+            if c.get("score", 0) < 4:
+                continue
+            h = c.get("health") or {}
+            t3 = c.get("trend3") or {}
+            try:
+                conn.execute(
+                    """INSERT OR IGNORE INTO signals
+                       (ts,date,sym,score,verdict,state,price,move5,rvol,dpm,
+                        buy_pct,retention,ext_open,mins_into,dilution,trend3_net)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (now, day, c["sym"], c.get("score"), c.get("verdict"),
+                     h.get("state"), c.get("price"), c.get("move"), c.get("rvol"),
+                     c.get("dpm"), c.get("buy_pct"), c.get("retention"),
+                     c.get("ext_open"), mins_into,
+                     1 if c.get("dilution") else 0, t3.get("net")))
+                n += conn.total_changes and 1 or 0
+            except Exception:
+                continue
+        conn.commit()
+        conn.close()
+    except Exception:
+        return 0
+    return n
+
+
+def update_outcomes(max_syms=20):
+    """Rellena los precios a +5/+15/+30 min y al cierre de las señales pendientes."""
+    try:
+        conn = _db()
+        day = datetime.now(tz=ET).date().isoformat()
+        rows = conn.execute(
+            """SELECT id,sym,ts,p5,p15,p30,pclose FROM signals
+               WHERE date=? AND (p5 IS NULL OR p15 IS NULL OR p30 IS NULL OR pclose IS NULL)
+               LIMIT ?""", (day, max_syms * 3)).fetchall()
+        if not rows:
+            conn.close()
+            return 0
+        syms = list({r[1] for r in rows})[:max_syms]
+        data = download_intraday(syms, period="1d", interval="1m",
+                                 prepost=True, auto_adjust=False)
+        now = int(_time.time())
+        et_now = datetime.now(tz=ET)
+        closed = (et_now.hour * 60 + et_now.minute) > SESSION_CLOSE_MIN
+        upd = 0
+        for rid, sym, ts, p5, p15, p30, pclose in rows:
+            bars = data.get(sym)
+            if not bars:
+                continue
+
+            def price_at(target_ts):
+                best = None
+                for b in bars:
+                    if b["t"] <= target_ts:
+                        best = b["close"]
+                    else:
+                        break
+                return best
+
+            sets, vals = [], []
+            for col, mins, cur in (("p5", 5, p5), ("p15", 15, p15), ("p30", 30, p30)):
+                if cur is None and now >= ts + mins * 60:
+                    px = price_at(ts + mins * 60)
+                    if px:
+                        sets.append(f"{col}=?")
+                        vals.append(round(float(px), 4))
+            if pclose is None and closed and bars:
+                sets.append("pclose=?")
+                vals.append(round(float(bars[-1]["close"]), 4))
+            if sets:
+                vals.append(rid)
+                conn.execute(f"UPDATE signals SET {','.join(sets)} WHERE id=?", vals)
+                upd += 1
+        conn.commit()
+        conn.close()
+        data.clear()
+        gc.collect()
+        return upd
+    except Exception:
+        return 0
+
+
+@app.get("/api/log/stats")
+def log_stats():
+    """Tus tasas reales, medidas sobre tus propias señales. La única cifra que
+    importa: ¿bate tu pantalla al prior del mercado, o no?"""
+    try:
+        conn = _db()
+        rows = conn.execute(
+            """SELECT sym,date,score,price,p5,p15,p30,pclose,mins_into,
+                      ext_open,dilution,state FROM signals ORDER BY ts DESC""").fetchall()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(500, f"registro no disponible: {e.__class__.__name__}")
+
+    def winrate(idx):
+        vals = [(r[3], r[idx]) for r in rows if r[3] and r[idx]]
+        if not vals:
+            return None
+        wins = sum(1 for p0, p1 in vals if p1 > p0)
+        rets = [(p1 - p0) / p0 * 100 for p0, p1 in vals]
+        return {"n": len(vals), "win_pct": round(wins / len(vals) * 100, 1),
+                "avg_ret": round(sum(rets) / len(rets), 2),
+                "median_ret": round(sorted(rets)[len(rets) // 2], 2)}
+
+    horizons = {"+5min": winrate(4), "+15min": winrate(5),
+                "+30min": winrate(6), "cierre": winrate(7)}
+
+    def by(keyfn, idx=7):
+        g = {}
+        for r in rows:
+            if not (r[3] and r[idx]):
+                continue
+            k = keyfn(r)
+            if k is None:
+                continue
+            g.setdefault(k, []).append((r[3], r[idx]))
+        out = {}
+        for k, v in g.items():
+            wins = sum(1 for p0, p1 in v if p1 > p0)
+            out[k] = {"n": len(v), "win_pct": round(wins / len(v) * 100, 1)}
+        return out
+
+    def hour_key(r):
+        m = r[8]
+        if m is None:
+            return None
+        h = (SESSION_OPEN_MIN + m) // 60
+        return f"{h:02d}:00"
+
+    def ext_key(r):
+        e = r[9]
+        if e is None:
+            return None
+        for lim, rate, label in EXT_BANDS:
+            if e < lim:
+                return f"<{lim if lim < 1e8 else '∞'}%"
+        return None
+
+    return {
+        "total": len(rows),
+        "con_resultado": sum(1 for r in rows if r[7]),
+        "horizontes": horizons,
+        "por_score": by(lambda r: f"{r[2]}/5"),
+        "por_hora": by(hour_key),
+        "por_extension": by(ext_key),
+        "por_estado": by(lambda r: r[11]),
+        "con_dilucion": by(lambda r: "dilución" if r[10] else "sin dilución"),
+        "base_rates": BASE_RATES,
+        "ultimas": [{"sym": r[0], "date": r[1], "score": r[2], "price": r[3],
+                     "pclose": r[7]} for r in rows[:15]],
+    }
+
+
+@app.get("/api/log/export")
+def log_export():
+    """Descarga el registro completo en CSV para analizarlo por fuera."""
+    from fastapi.responses import PlainTextResponse
+    try:
+        conn = _db()
+        cur = conn.execute("SELECT * FROM signals ORDER BY ts DESC")
+        cols = [d[0] for d in cur.description]
+        buf = _io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(cols)
+        w.writerows(cur.fetchall())
+        conn.close()
+        return PlainTextResponse(buf.getvalue(), media_type="text/csv",
+                                 headers={"Content-Disposition": "attachment; filename=senales.csv"})
+    except Exception as e:
+        raise HTTPException(500, f"no se pudo exportar: {e.__class__.__name__}")
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.get("/")
+def index():
+    return FileResponse("index.html")
+
+
+# ================= descubrimiento de volumen brusco en el mercado =================
+import statistics
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
+PREMARKET_OPEN_MIN = 4 * 60          # 4:00 AM ET
+SESSION_OPEN_MIN = 9 * 60 + 30
+SESSION_CLOSE_MIN = 16 * 60
+
+# Universo de respaldo si los screeners de Yahoo no responden
+FALLBACK_UNIVERSE = [
+    "NVDA","AMD","MU","SNDK","MRVL","ARM","INTC","TSM","QCOM","AVGO","SMCI",
+    "AAPL","MSFT","AMZN","META","GOOGL","TSLA","PLTR","COIN","MSTR","HOOD",
+    "SOFI","RIVN","LCID","NIO","F","BAC","T","PFE","XOM","CVX","OXY","AAL",
+    "CCL","UBER","ABNB","SHOP","PYPL","SNAP","BABA","PDD",
+]
+
+
+def detect_spikes(bars, k=3.0, base_win=20, min_vol=100000):
+    """bars: lista de {t, open, close, volume} en orden temporal.
+    Mismo algoritmo que el frontend: vol >= k × mediana de los base_win
+    minutos previos; minutos consecutivos se agrupan en un evento."""
+    n = len(bars)
+    flags = [False] * n
+    mult = [0.0] * n
+    warmup = min(base_win, 10)
+    for i in range(n):
+        prior = [b["volume"] for b in bars[max(0, i - base_win):i] if b["volume"] > 0]
+        if len(prior) < warmup:
+            continue
+        base = statistics.median(prior)
+        if base <= 0:
+            continue
+        mult[i] = bars[i]["volume"] / base
+        if bars[i]["volume"] >= min_vol and mult[i] >= k:
+            flags[i] = True
+    events = []
+    i = 0
+    while i < n:
+        if not flags[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and flags[j + 1]:
+            j += 1
+        vol = sum(b["volume"] for b in bars[i:j + 1])
+        peak = max(mult[i:j + 1])
+        ref = bars[i - 1]["close"] if i > 0 else bars[i]["open"]
+        c = bars[j]["close"]
+        chg = (c - ref) / ref * 100 if ref else 0.0
+        tipo = "absorción" if abs(chg) < 0.1 else ("comprador" if chg > 0 else "vendedor")
+        events.append({
+            "start": bars[i]["t"], "end": bars[j]["t"], "minutes": j - i + 1,
+            "vol": int(vol), "peak": round(peak, 2), "chg": round(chg, 2),
+            "tipo": tipo, "price": round(float(c), 2),
+        })
+        i = j + 1
+    return events
+
+
+def _clean_symbol(s):
+    return bool(s) and s.isalpha() and len(s) <= 5
+
+
+def _explosive_movers(limit=40):
+    """Consulta directa a Yahoo por movimiento explosivo, en ambas direcciones.
+    No depende de que el símbolo esté en una lista predefinida: pregunta por
+    'todo lo que se movió fuerte con volumen', que es justo lo que busca el radar."""
+    out = []
+    for asc, field in ((False, "percentchange"), (True, "percentchange")):
+        try:
+            q = yf.EquityQuery("and", [
+                yf.EquityQuery("gt", ["dayvolume", 200000]),
+                yf.EquityQuery("eq", ["region", "us"]),
+            ])
+            res = yf.screen(q, sortField=field, sortAsc=asc, size=limit)
+            quotes = res.get("quotes", []) if isinstance(res, dict) else []
+            for qt in quotes:
+                s = (qt.get("symbol") or "").upper()
+                if _clean_symbol(s) and s not in out:
+                    out.append(s)
+        except Exception:
+            continue
+    return out
+
+
+def get_universe(cap=70, pinned=None):
+    """Universo del día. Primero los que MÁS se movieron (consulta directa),
+    luego los screeners predefinidos intercalados para que todos aporten."""
+    syms, note = [], None
+    for s in (pinned or []):
+        s = s.upper().strip()
+        if _clean_symbol(s) and s not in syms:
+            syms.append(s)
+
+    movers = _explosive_movers()
+    for s in movers:
+        if s not in syms:
+            syms.append(s)
+
+    screens = ("day_gainers", "small_cap_gainers", "aggressive_small_caps",
+               "most_actives", "day_losers")
+    buckets = []
+    for scr in screens:
+        got = []
+        try:
+            res = yf.screen(scr, count=40)
+            quotes = res.get("quotes", []) if isinstance(res, dict) else []
+            for q in quotes:
+                s = (q.get("symbol") or "").upper()
+                if _clean_symbol(s):
+                    got.append(s)
+        except Exception:
+            pass
+        buckets.append(got)
+
+    depth = max((len(b) for b in buckets), default=0)
+    for i in range(depth):
+        for b in buckets:
+            if i < len(b) and b[i] not in syms:
+                syms.append(b[i])
+
+    if len(syms) <= len(pinned or []):
+        for s in FALLBACK_UNIVERSE:
+            if s not in syms:
+                syms.append(s)
+        note = "screeners de Yahoo no disponibles; usando universo fijo de respaldo"
+    return syms[:cap], note
+
+
+@app.get("/api/universe")
+def universe_debug(sym: str = ""):
+    """Diagnóstico: qué símbolos trae cada fuente y si uno concreto aparece."""
+    out = {"movers": [], "screens": {}, "total": 0}
+    try:
+        out["movers"] = _explosive_movers()
+    except Exception as e:
+        out["movers_error"] = str(e)
+    for scr in ("day_gainers", "small_cap_gainers", "aggressive_small_caps",
+                "most_actives", "day_losers"):
+        try:
+            res = yf.screen(scr, count=40)
+            quotes = res.get("quotes", []) if isinstance(res, dict) else []
+            out["screens"][scr] = [(q.get("symbol") or "").upper() for q in quotes]
+        except Exception as e:
+            out["screens"][scr] = ["ERROR: " + e.__class__.__name__]
+    syms, note = get_universe()
+    out["total"] = len(syms)
+    out["universe"] = syms
+    out["note"] = note
+    if sym:
+        s = sym.upper().strip()
+        found = {"in_universe": s in syms,
+                 "position": syms.index(s) + 1 if s in syms else None,
+                 "in_movers": s in out["movers"],
+                 "in_screens": [k for k, v in out["screens"].items() if s in v]}
+        out["lookup"] = {s: found}
+    return out
+
+
+def bars_from_frame(sub):
+    """Convierte el sub-DataFrame de un símbolo a la lista de barras del detector."""
+    if sub is None or sub.empty:
+        return []
+    sub = sub.dropna(subset=["Open", "Close"])
+    bars = []
+    for ix, r in sub.iterrows():
+        v = r.get("Volume")
+        hi = r.get("High"); lo = r.get("Low")
+        bars.append({
+            "t": int(ix.timestamp()),
+            "open": float(r["Open"]),
+            "close": float(r["Close"]),
+            "high": float(hi) if hi is not None and not pd.isna(hi) else float(r["Close"]),
+            "low": float(lo) if lo is not None and not pd.isna(lo) else float(r["Close"]),
+            "volume": 0 if pd.isna(v) else int(v),
+        })
+    return bars
+
+
+# ---- volumen promedio diario (30d) con caché en memoria ----
+import time as _time
+
+_daily_cache = {}  # sym -> ({avg_vol, prev_close}, expira_ts)
+
+
+import gc
+
+_result_cache = {}  # endpoint -> (key, data, ts)
+
+
+def cached_result(name, key, ttl=20):
+    ent = _result_cache.get(name)
+    if ent and ent[0] == key and (_time.time() - ent[2]) < ttl:
+        return ent[1]
+    return None
+
+
+def store_result(name, key, data):
+    _result_cache[name] = (key, data, _time.time())
+
+
+def download_intraday(syms, chunk=20, **kw):
+    """Descarga velas por lotes y convierte cada lote a listas ligeras,
+    liberando el DataFrame de inmediato. Un solo download de 110 símbolos
+    reventaba los 512MB de Render; por lotes el pico baja drásticamente."""
+    out = {}
+    for i in range(0, len(syms), chunk):
+        batch = syms[i:i + chunk]
+        df = None
+        try:
+            df = yf.download(tickers=batch, group_by="ticker",
+                             progress=False, threads=True, **kw)
+            if df is None or df.empty:
+                continue
+            for s in batch:
+                try:
+                    sub = df[s] if isinstance(df.columns, pd.MultiIndex) else df
+                    bars = bars_from_frame(sub)
+                    if bars:
+                        out[s] = bars
+                except Exception:
+                    continue
+        except Exception:
+            continue
+        finally:
+            del df
+            gc.collect()
+    return out
+
+
+def daily_stats(syms):
+    """Promedio de volumen 30d y cierre de la sesión ANTERIOR, por símbolo."""
+    now = _time.time()
+    missing = [s for s in syms if s not in _daily_cache or _daily_cache[s][1] < now]
+    if missing:
+        frames = {}
+        for i in range(0, len(missing), 25):
+            batch = missing[i:i + 25]
+            try:
+                d = yf.download(tickers=batch, period="3mo", interval="1d",
+                                prepost=False, auto_adjust=False, progress=False,
+                                threads=True, group_by="ticker")
+                for s in batch:
+                    try:
+                        sub = d[s] if isinstance(d.columns, pd.MultiIndex) else d
+                        frames[s] = sub[["Close", "Volume"]].copy()
+                    except Exception:
+                        pass
+                del d
+                gc.collect()
+            except Exception:
+                continue
+        today = datetime.now(tz=ET).date()
+        for s in missing:
+            info = {"avg_vol": None, "prev_close": None, "recent": []}
+            try:
+                sub = frames.get(s)
+                if sub is not None and not sub.empty:
+                    vols = sub["Volume"].dropna()
+                    closes = sub["Close"].dropna()
+                    if len(vols) >= 2:
+                        # 30 sesiones previas, excluyendo la barra de hoy si existe
+                        hist = vols.iloc[:-1] if vols.index[-1].date() == today else vols
+                        info["avg_vol"] = float(hist.iloc[-30:].mean()) if len(hist) else None
+                    elif len(vols) == 1:
+                        info["avg_vol"] = float(vols.mean())
+                    if len(closes) >= 1:
+                        if closes.index[-1].date() == today and len(closes) >= 2:
+                            info["prev_close"] = float(closes.iloc[-2])
+                        else:
+                            info["prev_close"] = float(closes.iloc[-1])
+                        info["recent"] = [(ix.date(), float(v))
+                                          for ix, v in closes.iloc[-8:].items()]
+            except Exception:
+                pass
+            _daily_cache[s] = (info, now + 1800)
+    return {s: _daily_cache[s][0] for s in syms}
+
+
+def avg_daily_volumes(syms):
+    st = daily_stats(syms)
+    return {s: st[s]["avg_vol"] for s in syms}
+
+
+# Fracción del volumen diario operada en cada bloque de 30 min (curva U típica del mercado US).
+_VOL_CURVE_30 = [13.0, 9.0, 7.5, 6.0, 5.0, 4.5, 4.5, 5.0, 5.5, 6.0, 7.0, 9.0, 18.0]
+
+
+def expected_vol_frac(mins_elapsed):
+    """Qué fracción del volumen diario debería haberse operado tras N minutos de sesión.
+    Lineal sobrestima el RVOL temprano: a los 25 min lo real es ~11%, no 6.4%."""
+    if mins_elapsed <= 0:
+        return 0.0
+    if mins_elapsed >= 390:
+        return 1.0
+    cum = 0.0
+    rem = float(mins_elapsed)
+    for bucket in _VOL_CURVE_30:
+        if rem >= 30:
+            cum += bucket
+            rem -= 30
+        else:
+            cum += bucket * (rem / 30.0)
+            break
+    return cum / 100.0
+
+
+def session_metrics(bars):
+    """VWAP de la sesión, extensión del precio vs VWAP y estructura de mínimos crecientes."""
+    cum_pv = cum_v = 0.0
+    for b in bars:
+        tp = (b["high"] + b["low"] + b["close"]) / 3.0
+        cum_pv += tp * b["volume"]
+        cum_v += b["volume"]
+    vwap = cum_pv / cum_v if cum_v > 0 else None
+    last = bars[-1]["close"] if bars else None
+    ext = (last - vwap) / vwap * 100 if (vwap and last) else None
+
+    swings = []
+    for i in range(2, len(bars) - 2):
+        lo = bars[i]["low"]
+        neigh = [bars[j]["low"] for j in (i - 2, i - 1, i + 1, i + 2)]
+        if all(lo < x for x in neigh):
+            swings.append(lo)
+    higher_lows = None
+    if len(swings) >= 2:
+        tail = swings[-3:]
+        higher_lows = all(tail[q] >= tail[q - 1] * 0.999 for q in range(1, len(tail)))
+    return {"vwap": round(vwap, 4) if vwap else None,
+            "ext": round(ext, 2) if ext is not None else None,
+            "higher_lows": higher_lows,
+            "swings": len(swings)}
+
+
+def staircase_metrics(bars, tol=0.998):
+    """Clasifica la ESTRUCTURA del movimiento desde velas de 1m, para juzgarlo
+    sin abrir el gráfico:
+      escalera   -> mínimos crecientes, retrocesos superficiales, avance limpio
+      parabolica -> sube vertical sin corregir (la que NO hay que perseguir)
+      irregular  -> sube pero sin estructura confiable
+    """
+    if len(bars) < 12:
+        return None
+    lows = [b["low"] for b in bars]
+    highs = [b["high"] for b in bars]
+    closes = [b["close"] for b in bars]
+    n_all = len(bars)
+
+    swings = []
+    for i in range(2, n_all - 2):
+        lo = lows[i]
+        if lo < lows[i-2] and lo < lows[i-1] and lo < lows[i+1] and lo < lows[i+2]:
+            swings.append((i, lo))
+    # confirmación relajada cerca del final: un mínimo fresco cuenta 2 min antes
+    for i in (n_all - 3, n_all - 2):
+        if i > 2 and lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[min(i+1, n_all-1)]:
+            if not any(abs(i - j) <= 1 for j, _ in swings):
+                swings.append((i, lows[i]))
+    # el origen del tramo (mínimo absoluto) siempre es un peldaño válido
+    origin = min(range(n_all), key=lambda i: lows[i])
+    if not any(abs(origin - j) <= 1 for j, _ in swings):
+        swings.append((origin, lows[origin]))
+    swings.sort()
+    if not swings:
+        return None
+
+    anchor = min(range(len(swings)), key=lambda k: swings[k][1])
+    seq = swings[anchor:]
+    legs = 1
+    for k in range(1, len(seq)):
+        if seq[k][1] >= seq[k-1][1] * tol:
+            legs += 1
+        else:
+            break
+
+    start_i, start_px = seq[0]
+    last_px = closes[-1]
+    if last_px <= start_px or start_i >= n_all - 4:
+        return None
+    gain = (last_px - start_px) / start_px * 100
+    climb_mins = n_all - start_i
+
+    peak, max_dd = start_px, 0.0
+    for i in range(start_i, n_all):
+        peak = max(peak, highs[i])
+        dd = (peak - lows[i]) / peak * 100 if peak else 0
+        max_dd = max(max_dd, dd)
+
+    seg = closes[start_i:]
+    n = len(seg)
+    if n < 5:
+        return None
+    mx, my = (n - 1) / 2.0, sum(seg) / n
+    sxy = sum((i - mx) * (seg[i] - my) for i in range(n))
+    sxx = sum((i - mx) ** 2 for i in range(n))
+    syy = sum((seg[i] - my) ** 2 for i in range(n))
+    if sxx <= 0 or syy <= 0 or sxy <= 0:
+        return None
+    r2 = (sxy * sxy) / (sxx * syy)
+    ratio = gain / max_dd if max_dd > 0.05 else 99.0
+
+    if legs >= 2 and r2 >= 0.5 and ratio >= 2.0:
+        kind = "escalera"
+    elif gain >= 5 and max_dd < gain * 0.08 and r2 >= 0.7:
+        kind = "parabolica"
+    else:
+        kind = "irregular"
+
+    return {"kind": kind, "legs": legs, "climb_mins": climb_mins,
+            "gain": round(gain, 2), "pullback": round(max_dd, 2),
+            "r2": round(r2, 2), "ratio": round(min(ratio, 99), 1),
+            "early": climb_mins <= 45 and gain <= 40}
+
+
+def trend3(info):
+    """Las 3 sesiones COMPLETAS previas a hoy: un punto por día (verde si cerró
+    arriba, rojo si abajo) y el neto acumulado. Responde de un vistazo si el
+    stock llega con arrastre alcista o viene cayendo."""
+    rec = (info or {}).get("recent") or []
+    today = datetime.now(tz=ET).date()
+    hist = [(d, c) for d, c in rec if d < today and c and c > 0]
+    if len(hist) < 4:
+        return None
+    hist = hist[-4:]
+    days = []
+    for i in range(1, 4):
+        prev, cur = hist[i - 1][1], hist[i][1]
+        pct = (cur - prev) / prev * 100 if prev else 0.0
+        days.append({"d": str(hist[i][0])[5:], "pct": round(pct, 2), "up": pct >= 0})
+    net = (hist[-1][1] - hist[0][1]) / hist[0][1] * 100 if hist[0][1] else 0.0
+    ups = sum(1 for d in days if d["up"])
+    return {"days": days, "net": round(net, 2), "up": net >= 0,
+            "streak": ups, "label": f"{ups}/3 al alza"}
+
+
+def flow_split(bars, tail=30):
+    """Reparte el volumen entre compra y venta según dónde cierra cada vela
+    dentro de su rango (lógica de acumulación/distribución).
+    OJO: es una APROXIMACIÓN. Con velas de 1 minuto no se sabe quién fue el
+    agresor real de cada operación; para eso hacen falta datos tick a tick.
+    Aun así distingue bien presión compradora de vendedora en el agregado."""
+    if not bars:
+        return None
+    buy = sell = 0.0
+    cvd = []
+    run = 0.0
+    for b in bars:
+        hi, lo, c, v = b["high"], b["low"], b["close"], b["volume"]
+        rng = hi - lo
+        mfm = ((c - lo) - (hi - c)) / rng if rng > 0 else 0.0
+        bv = v * (1 + mfm) / 2.0
+        sv = v * (1 - mfm) / 2.0
+        buy += bv
+        sell += sv
+        run += bv - sv
+        cvd.append(run)
+    tot = buy + sell
+    if tot <= 0:
+        return None
+    delta_pct = (buy - sell) / tot * 100
+
+    # tramo reciente: ¿la presión está cambiando AHORA?
+    tb = bars[-tail:] if len(bars) > tail else bars
+    tbuy = tsell = 0.0
+    for b in tb:
+        hi, lo, c, v = b["high"], b["low"], b["close"], b["volume"]
+        rng = hi - lo
+        mfm = ((c - lo) - (hi - c)) / rng if rng > 0 else 0.0
+        tbuy += v * (1 + mfm) / 2.0
+        tsell += v * (1 - mfm) / 2.0
+    ttot = tbuy + tsell
+    tail_pct = (tbuy - tsell) / ttot * 100 if ttot > 0 else None
+
+    # divergencia: el dato más valioso — flujo contra precio
+    first_px = bars[0]["open"]
+    price_chg = (bars[-1]["close"] - first_px) / first_px * 100 if first_px else 0.0
+    div = None
+    # los movimientos fuertes se evalúan primero: son los casos más informativos
+    if delta_pct <= -12 and price_chg >= 3:
+        div = "subida sin respaldo"   # sube, pero el flujo es vendedor: rally frágil
+    elif delta_pct >= 12 and price_chg <= -3:
+        div = "caída absorbida"       # baja, pero están comprando: alguien recoge
+    elif delta_pct >= 12 and abs(price_chg) <= 0.5:
+        div = "acumulación"           # compran y el precio no sube: absorben la oferta
+    elif delta_pct <= -12 and abs(price_chg) <= 0.5:
+        div = "distribución"          # venden y el precio no baja: reparten contra la demanda
+
+    return {"buy": round(buy), "sell": round(sell),
+            "buy_pct": round(buy / tot * 100, 1),
+            "delta": round(buy - sell),
+            "delta_pct": round(delta_pct, 1),
+            "tail_pct": round(tail_pct, 1) if tail_pct is not None else None,
+            "divergence": div,
+            "price_chg": round(price_chg, 2)}
+
+
+def whale_metrics(events):
+    """Huella institucional: dólares movidos en eventos, impacto por dólar y bloques."""
+    if not events:
+        return {"dvol": 0.0, "impact": None, "blocks": 0, "tier": "baja"}
+    dvol = sum(e["vol"] * e["price"] for e in events)
+    move = sum(abs(e["chg"]) for e in events)
+    impact = round(move / (dvol / 1e7), 2) if dvol > 0 else None  # % por cada $10M
+    # bloque = un solo minuto con $10M+ cruzados (tamaño institucional por definición)
+    blocks = sum(1 for e in events if e["vol"] * e["price"] >= 1e7)
+    if dvol >= 25e6 or blocks >= 1 or (dvol >= 1e7 and len(events) >= 3):
+        tier = "alta"
+    elif dvol >= 3e6:
+        tier = "media"
+    else:
+        tier = "baja"
+    return {"dvol": round(dvol), "impact": impact, "blocks": blocks, "tier": tier}
+
+
+@app.get("/api/discover")
+def discover(k: float = 3.0, base: int = 20, min_vol: int = 100000, min_rel: float = 2.0,
+             min_dvol: float = 250000, min_price: float = 0.10):
+    if not (1.0 <= k <= 50) or not (5 <= base <= 120) or not (0 <= min_rel <= 50):
+        raise HTTPException(400, "parámetros fuera de rango")
+    dkey = f"{k}|{base}|{min_vol}|{min_rel}|{min_dvol}|{min_price}"
+    hit = cached_result("discover", dkey)
+    if hit is not None:
+        return hit
+    syms, note = get_universe()
+    avgs = avg_daily_volumes(syms)
+    data = download_intraday(syms, period="1d", interval="1m",
+                             prepost=False, auto_adjust=False)
+    if not data:
+        raise HTTPException(502, "no se pudo descargar datos intradía")
+
+    now_et = datetime.now(tz=ET)
+    mins = now_et.hour * 60 + now_et.minute
+    live = SESSION_OPEN_MIN <= mins <= SESSION_CLOSE_MIN and now_et.weekday() < 5
+    cutoff = None
+    if live:
+        cutoff = int(datetime.now(timezone.utc).timestamp()) - 45 * 60
+    # minutos de sesión transcurridos según el RELOJ: contar velas subestima el
+    # tiempo en símbolos ilíquidos (los minutos sin operaciones no generan vela)
+    # e infla el RVOL de forma absurda.
+    mins_elapsed = max(1, min(390, mins - SESSION_OPEN_MIN)) if live else 390
+    day_frac = expected_vol_frac(mins_elapsed)
+    eff_dvol = min_dvol * max(0.02, day_frac)
+
+    events, scanned = [], 0
+    for s in syms:
+        try:
+            bars = data.get(s)
+            if not bars:
+                continue
+            scanned += 1
+            day_open = bars[0]["open"]
+            adv = avgs.get(s)
+            per_min = adv / 390.0 if adv else None
+            cum = sum(b["volume"] for b in bars)
+            rvol_dia = round(cum / (adv * day_frac), 2) if (adv and day_frac > 0) else None
+            last_px = bars[-1]["close"]
+            # descarta sub-penny y volumen irrisorio: unas pocas acciones a
+            # $0.0001 producen multiplicadores enormes sin significado
+            if last_px < min_price or (cum * last_px) < eff_dvol:
+                continue
+            kept = []
+            for e in detect_spikes(bars, k, base, min_vol):
+                if cutoff and e["end"] < cutoff:
+                    continue
+                rel = round((e["vol"] / e["minutes"]) / per_min, 1) if per_min else None
+                if rel is not None and rel < min_rel:
+                    continue  # normal para ESTE stock, aunque sea spike local
+                e["sym"] = s
+                e["day_open"] = round(float(day_open), 2)
+                e["rel_min"] = rel
+                e["rvol_dia"] = rvol_dia
+                e["dvol"] = round(e["vol"] * e["price"])
+                kept.append(e)
+            if kept:
+                sm = session_metrics(bars)
+                wm = whale_metrics(kept)
+                try:
+                    fl = flow_split(bars)
+                except Exception:
+                    fl = None
+                for e in kept:
+                    e["flow"] = fl
+                    e["w_tier"] = wm["tier"]
+                    e["w_dvol"] = wm["dvol"]
+                    e["impact"] = wm["impact"]
+                    e["blocks"] = wm["blocks"]
+                    e["higher_lows"] = sm["higher_lows"]
+                    e["ext_vwap"] = sm["ext"]
+                events.extend(kept)
+        except Exception:
+            continue
+    events.sort(key=lambda e: (-e["start"], -e["peak"]))
+    del data
+    gc.collect()
+    result = {
+        "universe": len(syms), "scanned": scanned,
+        "events": events[:80], "note": note,
+        "recent_only": cutoff is not None,
+    }
+    store_result("discover", dkey, result)
+    return result
