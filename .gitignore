@@ -1,0 +1,4 @@
+signals.jsonl
+__pycache__/
+*.pyc
+.env
