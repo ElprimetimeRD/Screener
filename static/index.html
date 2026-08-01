@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#12100E">
+<title>Escalera</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --base:#12100E; --surface:#1C1917; --raised:#252220;
+  --ink:#EDE8E0; --muted:#8A8178; --faint:#5A534C;
+  --line:#302B26;
+  --go:#5FA777; --wait:#C99A3F; --block:#B5544C;
+  --step:22px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+body{
+  background:var(--base); color:var(--ink);
+  font-family:Archivo,system-ui,sans-serif;
+  font-size:15px; line-height:1.45;
+  padding:0 0 env(safe-area-inset-bottom);
+  -webkit-font-smoothing:antialiased;
+}
+.mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}
+
+/* ---------- cabecera ---------- */
+header{
+  position:sticky; top:0; z-index:10;
+  background:rgba(18,16,14,.94); backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line);
+  padding:14px 16px 12px;
+}
+.brand{display:flex;align-items:baseline;gap:10px;margin-bottom:12px}
+h1{
+  font-size:19px;font-weight:800;letter-spacing:-.03em;
+  text-transform:uppercase;
+}
+.stamp{font-size:10px;color:var(--faint);letter-spacing:.14em;text-transform:uppercase}
+.controls{display:flex;gap:8px;align-items:stretch}
+.field{flex:1;position:relative}
+.field label{
+  position:absolute;top:6px;left:11px;
+  font-size:9px;letter-spacing:.13em;text-transform:uppercase;color:var(--faint);
+  pointer-events:none;
+}
+.field input{
+  width:100%;background:var(--surface);border:1px solid var(--line);
+  border-radius:5px;color:var(--ink);
+  font-family:'JetBrains Mono',monospace;font-size:15px;font-weight:500;
+  padding:20px 11px 7px;
+}
+.field input:focus{outline:2px solid var(--muted);outline-offset:-1px}
+button.run{
+  background:var(--ink);color:var(--base);border:0;border-radius:5px;
+  font-family:Archivo,sans-serif;font-size:12px;font-weight:700;
+  letter-spacing:.09em;text-transform:uppercase;
+  padding:0 18px;cursor:pointer;
+}
+button.run:disabled{opacity:.4;cursor:wait}
+button.run:focus-visible{outline:2px solid var(--go);outline-offset:2px}
+
+.tally{
+  display:flex;gap:16px;margin-top:11px;
+  font-size:11px;letter-spacing:.05em;color:var(--muted);
+}
+.tally b{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700}
+.tally .n-go b{color:var(--go)} .tally .n-wait b{color:var(--wait)} .tally .n-block b{color:var(--block)}
+
+/* ---------- estados ---------- */
+.msg{padding:56px 24px;text-align:center;color:var(--muted);font-size:14px}
+.msg strong{display:block;color:var(--ink);font-size:16px;margin-bottom:7px;font-weight:600}
+.msg.err strong{color:var(--block)}
+
+/* ---------- tarjeta ---------- */
+main{padding:12px 12px 40px;display:flex;flex-direction:column;gap:9px}
+.card{
+  background:var(--surface);border:1px solid var(--line);
+  border-left:3px solid var(--faint);border-radius:6px;overflow:hidden;
+  animation:rise .3s ease both;
+}
+@keyframes rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){.card{animation:none}}
+.card.go{border-left-color:var(--go)}
+.card.wait{border-left-color:var(--wait)}
+.card.block{border-left-color:var(--block)}
+
+.head{display:flex;align-items:center;gap:10px;padding:12px 13px;cursor:pointer}
+.sym{font-family:'JetBrains Mono',monospace;font-size:17px;font-weight:700;letter-spacing:-.01em}
+.lev{
+  font-size:9px;font-weight:700;color:var(--base);background:var(--muted);
+  padding:2px 5px;border-radius:3px;letter-spacing:.04em;
+}
+.verdict{
+  margin-left:auto;font-size:10px;font-weight:700;
+  letter-spacing:.13em;text-transform:uppercase;
+}
+.go .verdict{color:var(--go)} .wait .verdict{color:var(--wait)} .block .verdict{color:var(--block)}
+.caret{color:var(--faint);font-size:11px;transition:transform .18s}
+.card.open .caret{transform:rotate(90deg)}
+
+/* escalones = dias de racha */
+.steps{display:flex;align-items:flex-end;gap:2px;height:14px}
+.steps i{width:4px;background:var(--faint);border-radius:1px;display:block}
+.go .steps i{background:var(--go)} .wait .steps i{background:var(--wait)}
+
+.strip{
+  display:flex;gap:14px;padding:0 13px 12px;
+  font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);
+}
+.strip b{color:var(--ink);font-weight:500}
+
+/* ---------- cuerpo ---------- */
+.body{display:none;border-top:1px solid var(--line);padding:13px}
+.card.open .body{display:block}
+
+.pos{background:var(--raised);border-radius:5px;padding:12px;margin-bottom:12px}
+.pos-top{display:flex;align-items:baseline;gap:9px;margin-bottom:3px}
+.notional{font-family:'JetBrains Mono',monospace;font-size:25px;font-weight:700;letter-spacing:-.02em}
+.pos-sub,.pos-stop{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)}
+.pos-stop{margin-top:5px}
+.pos-stop b{color:var(--block);font-weight:500}
+
+/* SIGNATURE: que tope esta mandando */
+.caps{margin-top:13px;padding-top:12px;border-top:1px solid var(--line)}
+.caps-h{font-size:9px;letter-spacing:.13em;text-transform:uppercase;color:var(--faint);margin-bottom:9px}
+.cap{display:grid;grid-template-columns:64px 1fr auto;align-items:center;gap:8px;margin-bottom:6px}
+.cap-n{font-size:10px;color:var(--muted);letter-spacing:.02em}
+.cap-track{height:7px;background:#0D0B0A;border-radius:4px;overflow:hidden}
+.cap-fill{height:100%;background:var(--faint);border-radius:4px;transition:width .45s cubic-bezier(.4,0,.2,1)}
+.cap-v{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted)}
+.cap.binds .cap-n{color:var(--ink);font-weight:600}
+.cap.binds .cap-fill{background:var(--go)}
+.cap.binds .cap-v{color:var(--go);font-weight:700}
+.binds-note{margin-top:9px;font-size:11px;color:var(--muted);line-height:1.4}
+.binds-note b{color:var(--ink);font-weight:600}
+
+.rules{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:11px}
+.rule{
+  font-size:10px;padding:4px 7px;border-radius:4px;
+  background:var(--raised);color:var(--muted);
+  display:flex;align-items:center;gap:4px;
+}
+.rule::before{content:'✓';font-weight:700;color:var(--go)}
+.rule.no{color:var(--ink)}
+.rule.no::before{content:'✕';color:var(--block)}
+.detail{font-size:11px;color:var(--muted);line-height:1.5;margin-bottom:9px;font-family:'JetBrains Mono',monospace}
+.warn{
+  font-size:11px;line-height:1.45;color:var(--wait);
+  background:rgba(201,154,63,.09);border-left:2px solid var(--wait);
+  padding:7px 9px;border-radius:0 4px 4px 0;margin-bottom:5px;
+}
+
+/* ---------- rendimiento ---------- */
+.perf{margin:16px 12px 0;background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:14px}
+.perf h2{font-size:11px;letter-spacing:.13em;text-transform:uppercase;color:var(--faint);margin-bottom:10px;font-weight:600}
+.perf-row{display:flex;justify-content:space-between;align-items:baseline;padding:6px 0;border-bottom:1px solid var(--line);font-size:12px}
+.perf-row:last-of-type{border:0}
+.perf-row span{color:var(--muted)}
+.perf-row b{font-family:'JetBrains Mono',monospace;font-weight:700}
+.edge-pos{color:var(--go)} .edge-neg{color:var(--block)}
+.perf-note{margin-top:10px;font-size:11px;color:var(--muted);line-height:1.5}
+.store-tag{margin-top:9px;font-size:10px;color:var(--faint);letter-spacing:.03em}
+.store-tag.warn-tag{color:var(--wait)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <h1>Escalera</h1>
+    <span class="stamp" id="stamp">—</span>
+  </div>
+  <div class="controls">
+    <div class="field">
+      <label for="eq">Capital</label>
+      <input id="eq" class="mono" type="number" value="30000" min="0" step="1000" inputmode="numeric">
+    </div>
+    <div class="field">
+      <label for="syms">Tickers</label>
+      <input id="syms" class="mono" type="text" placeholder="watchlist" autocapitalize="characters" autocomplete="off">
+    </div>
+    <button class="run" id="run">Ver</button>
+  </div>
+  <div class="tally" id="tally" hidden>
+    <span class="n-go"><b id="cGo">0</b> listos</span>
+    <span class="n-wait"><b id="cWait">0</b> esperando</span>
+    <span class="n-block"><b id="cBlock">0</b> bloqueados</span>
+  </div>
+</header>
+
+<div id="out"><div class="msg"><strong>Sin datos todavía</strong>Toca Ver para revisar la watchlist.</div></div>
+<div id="perf"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const money = n => n==null ? '—' : '$'+Math.round(n).toLocaleString('en-US');
+const num = (n,d=2) => n==null ? '—' : Number(n).toFixed(d);
+const LABEL = {GO:'Listo', WAIT:'Esperando', BLOCK:'Bloqueado'};
+const RULE_ES = {
+  higher_lows_confirmados:'mínimos crecientes',
+  rvol_sostenido:'RVOL sostenido',
+  no_parabolico:'no parabólico',
+  liquidez_suficiente:'liquidez',
+  sin_riesgo_earnings:'sin earnings',
+  datos:'datos'
+};
+
+function stepBars(n){
+  if(!n) return '<span class="cap-v">sin racha</span>';
+  let h='<div class="steps">';
+  for(let i=1;i<=Math.min(n,8);i++) h+=`<i style="height:${Math.min(4+i*2.4,14)}px"></i>`;
+  return h+'</div>';
+}
+
+/* Elemento firma: los tres topes, resaltando el que manda */
+function capsBlock(p){
+  if(!p || !p.caps) return '';
+  const caps = p.caps, max = Math.max(...Object.values(caps));
+  const order = ['riesgo','concentracion','liquidez'];
+  const names = {riesgo:'Riesgo', concentracion:'Concentr.', liquidez:'Liquidez'};
+  let rows='';
+  for(const k of order){
+    if(caps[k]==null) continue;
+    const binds = k===p.binding_constraint;
+    const w = max>0 ? Math.max(caps[k]/max*100,2) : 0;
+    rows += `<div class="cap ${binds?'binds':''}">
+      <span class="cap-n">${names[k]}</span>
+      <span class="cap-track"><span class="cap-fill" style="width:${w}%"></span></span>
+      <span class="cap-v">${money(caps[k])}</span></div>`;
+  }
+  return `<div class="caps"><div class="caps-h">Qué está limitando el tamaño</div>${rows}
+    <div class="binds-note">Manda <b>${names[p.binding_constraint]||p.binding_constraint}</b>.
+    ${p.economic_exposure&&p.leverage_factor>1
+      ? `Con el ${p.leverage_factor}× son <b>${money(p.economic_exposure)}</b> de exposición al subyacente.`
+      : ''}</div></div>`;
+}
+
+function card(r,i){
+  const v=r.verdict, s=r.streak||{}, p=r.position||{};
+  const rules=(r.rules||[]).map(x=>
+    `<span class="rule ${x.passed?'':'no'}">${RULE_ES[x.name]||x.name}</span>`).join('');
+  const failed=(r.rules||[]).filter(x=>!x.passed).map(x=>x.detail).filter(Boolean);
+  const warns=(r.warnings||[]).map(w=>`<div class="warn">${w}</div>`).join('');
+
+  const pos = p.ok ? `<div class="pos">
+      <div class="pos-top"><span class="notional">${money(p.notional)}</span>
+        <span class="pos-sub">${p.shares} acc @ $${num(p.entry)}</span></div>
+      <div class="pos-sub">${num(p.pct_of_equity,1)}% del capital</div>
+      <div class="pos-stop">stop <b>$${num(p.stop_price)}</b> · −${num(p.stop_pct,1)}% · arriesgas ${money(p.risk_amount)}</div>
+      ${capsBlock(p)}</div>` : '';
+
+  return `<article class="card ${v.toLowerCase()}" style="animation-delay:${Math.min(i*28,300)}ms">
+    <div class="head" onclick="this.parentNode.classList.toggle('open')">
+      <span class="sym">${r.symbol}</span>
+      ${r.leverage_factor?`<span class="lev">${r.leverage_factor>0?'+':''}${r.leverage_factor}×</span>`:''}
+      ${stepBars(s.streak_days)}
+      <span class="verdict">${LABEL[v]||v}</span>
+      <span class="caret">▸</span>
+    </div>
+    <div class="strip">
+      <span>RVOL <b>${num(s.avg_rvol_streak)}×</b></span>
+      <span>ext <b>${num(s.extension_atr)} ATR</b></span>
+      ${s.gain_pct_streak!=null?`<span>racha <b>${num(s.gain_pct_streak,1)}%</b></span>`:''}
+    </div>
+    <div class="body">
+      ${pos}
+      <div class="rules">${rules}</div>
+      ${failed.length?`<div class="detail">${failed.join('<br>')}</div>`:''}
+      ${warns}
+    </div></article>`;
+}
+
+async function scan(){
+  const btn=$('run'); btn.disabled=true; btn.textContent='...';
+  const eq=$('eq').value||0, sy=$('syms').value.trim();
+  const q=new URLSearchParams({equity:eq}); if(sy) q.set('symbols',sy);
+  $('out').innerHTML='<div class="msg"><strong>Consultando</strong>La primera vez puede tardar un minuto si el servicio estaba dormido.</div>';
+  try{
+    const res=await fetch('/scan?'+q);
+    if(!res.ok) throw new Error('El servidor respondió '+res.status);
+    const d=await res.json();
+    $('cGo').textContent=d.go; $('cWait').textContent=d.wait; $('cBlock').textContent=d.block;
+    $('tally').hidden=false;
+    $('stamp').textContent=new Date(d.generated_at).toLocaleTimeString('es-DO',{hour:'2-digit',minute:'2-digit'});
+    $('out').innerHTML = d.results.length
+      ? '<main>'+d.results.map(card).join('')+'</main>'
+      : '<div class="msg"><strong>Ningún ticker devolvió datos</strong>Revisa los símbolos.</div>';
+    perf();
+  }catch(e){
+    $('out').innerHTML=`<div class="msg err"><strong>No se pudo consultar</strong>${e.message}</div>`;
+  }
+  btn.disabled=false; btn.textContent='Ver';
+}
+
+async function perf(){
+  try{
+    const [pRes,sRes]=await Promise.all([
+      fetch('/signals/performance'), fetch('/signals/status')]);
+    const p=await pRes.json(), st=await sRes.json();
+    const tag=`<div class="store-tag ${st.persistent?'':'warn-tag'}">${st.note}${st.count!=null?` · ${st.count} señales guardadas`:''}</div>`;
+    if(!p.ok){
+      $('perf').innerHTML=`<div class="perf"><h2>Rendimiento</h2>
+        <div class="perf-note">${p.reason}. Cada revisión guarda las señales; vuelve en unos días para ver si el filtro realmente aporta.</div>${tag}</div>`;
+      return;
+    }
+    const go=p.by_verdict.GO||{}, edge=p.edge_vs_base_pct;
+    $('perf').innerHTML=`<div class="perf"><h2>Rendimiento</h2>
+      <div class="perf-row"><span>Señales medidas</span><b>${p.n_signals}</b></div>
+      <div class="perf-row"><span>Aciertos en LISTO</span><b>${go.win_rate!=null?go.win_rate+'%':'—'}</b></div>
+      <div class="perf-row"><span>Base del mercado</span><b>${p.base_rate_pct}%</b></div>
+      <div class="perf-row"><span>Ventaja</span><b class="${edge>0?'edge-pos':'edge-neg'}">${edge>0?'+':''}${edge}%</b></div>
+      <div class="perf-note">${p.verdict}. La ventaja es la diferencia entre acertar siguiendo el filtro y acertar entrando cualquier día en los mismos tickers. Si no es positiva, el filtro no está aportando.</div>${tag}</div>`;
+  }catch(e){ $('perf').innerHTML=''; }
+}
+
+$('run').addEventListener('click',scan);
+$('syms').addEventListener('keydown',e=>{if(e.key==='Enter')scan()});
+$('eq').addEventListener('keydown',e=>{if(e.key==='Enter')scan()});
+perf();
+</script>
+</body>
+</html>
